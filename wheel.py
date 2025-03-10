@@ -1,182 +1,134 @@
-import logging
-import os
-import shutil
-from optparse import Values
-from typing import List
+"""Support functions for working with wheel files.
+"""
 
-from pip._internal.cache import WheelCache
-from pip._internal.cli import cmdoptions
-from pip._internal.cli.req_command import RequirementCommand, with_cleanup
-from pip._internal.cli.status_codes import SUCCESS
-from pip._internal.exceptions import CommandError
-from pip._internal.operations.build.build_tracker import get_build_tracker
-from pip._internal.req.req_install import (
-    InstallRequirement,
-    check_legacy_setup_py_options,
-)
-from pip._internal.utils.misc import ensure_dir, normalize_path
-from pip._internal.utils.temp_dir import TempDirectory
-from pip._internal.wheel_builder import build, should_build_for_wheel_command
+import logging
+from email.message import Message
+from email.parser import Parser
+from typing import Tuple
+from zipfile import BadZipFile, ZipFile
+
+from pip._vendor.packaging.utils import canonicalize_name
+
+from pip._internal.exceptions import UnsupportedWheel
+
+VERSION_COMPATIBLE = (1, 0)
+
 
 logger = logging.getLogger(__name__)
 
 
-class WheelCommand(RequirementCommand):
+def parse_wheel(wheel_zip: ZipFile, name: str) -> Tuple[str, Message]:
+    """Extract information from the provided wheel, ensuring it meets basic
+    standards.
+
+    Returns the name of the .dist-info directory and the parsed WHEEL metadata.
     """
-    Build Wheel archives for your requirements and dependencies.
+    try:
+        info_dir = wheel_dist_info_dir(wheel_zip, name)
+        metadata = wheel_metadata(wheel_zip, info_dir)
+        version = wheel_version(metadata)
+    except UnsupportedWheel as e:
+        raise UnsupportedWheel(f"{name} has an invalid wheel, {e}")
 
-    Wheel is a built-package format, and offers the advantage of not
-    recompiling your software during every install. For more details, see the
-    wheel docs: https://wheel.readthedocs.io/en/latest/
+    check_compatibility(version, name)
 
-    'pip wheel' uses the build system interface as described here:
-    https://pip.pypa.io/en/stable/reference/build-system/
+    return info_dir, metadata
 
+
+def wheel_dist_info_dir(source: ZipFile, name: str) -> str:
+    """Returns the name of the contained .dist-info directory.
+
+    Raises AssertionError or UnsupportedWheel if not found, >1 found, or
+    it doesn't match the provided name.
     """
+    # Zip file path separators must be /
+    subdirs = {p.split("/", 1)[0] for p in source.namelist()}
 
-    usage = """
-      %prog [options] <requirement specifier> ...
-      %prog [options] -r <requirements file> ...
-      %prog [options] [-e] <vcs project url> ...
-      %prog [options] [-e] <local project path> ...
-      %prog [options] <archive url/path> ..."""
+    info_dirs = [s for s in subdirs if s.endswith(".dist-info")]
 
-    def add_options(self) -> None:
-        self.cmd_opts.add_option(
-            "-w",
-            "--wheel-dir",
-            dest="wheel_dir",
-            metavar="dir",
-            default=os.curdir,
-            help=(
-                "Build wheels into <dir>, where the default is the "
-                "current working directory."
-            ),
-        )
-        self.cmd_opts.add_option(cmdoptions.no_binary())
-        self.cmd_opts.add_option(cmdoptions.only_binary())
-        self.cmd_opts.add_option(cmdoptions.prefer_binary())
-        self.cmd_opts.add_option(cmdoptions.no_build_isolation())
-        self.cmd_opts.add_option(cmdoptions.use_pep517())
-        self.cmd_opts.add_option(cmdoptions.no_use_pep517())
-        self.cmd_opts.add_option(cmdoptions.check_build_deps())
-        self.cmd_opts.add_option(cmdoptions.constraints())
-        self.cmd_opts.add_option(cmdoptions.editable())
-        self.cmd_opts.add_option(cmdoptions.requirements())
-        self.cmd_opts.add_option(cmdoptions.src())
-        self.cmd_opts.add_option(cmdoptions.ignore_requires_python())
-        self.cmd_opts.add_option(cmdoptions.no_deps())
-        self.cmd_opts.add_option(cmdoptions.progress_bar())
+    if not info_dirs:
+        raise UnsupportedWheel(".dist-info directory not found")
 
-        self.cmd_opts.add_option(
-            "--no-verify",
-            dest="no_verify",
-            action="store_true",
-            default=False,
-            help="Don't verify if built wheel is valid.",
+    if len(info_dirs) > 1:
+        raise UnsupportedWheel(
+            "multiple .dist-info directories found: {}".format(", ".join(info_dirs))
         )
 
-        self.cmd_opts.add_option(cmdoptions.config_settings())
-        self.cmd_opts.add_option(cmdoptions.build_options())
-        self.cmd_opts.add_option(cmdoptions.global_options())
+    info_dir = info_dirs[0]
 
-        self.cmd_opts.add_option(
-            "--pre",
-            action="store_true",
-            default=False,
-            help=(
-                "Include pre-release and development versions. By default, "
-                "pip only finds stable versions."
-            ),
+    info_dir_name = canonicalize_name(info_dir)
+    canonical_name = canonicalize_name(name)
+    if not info_dir_name.startswith(canonical_name):
+        raise UnsupportedWheel(
+            f".dist-info directory {info_dir!r} does not start with {canonical_name!r}"
         )
 
-        self.cmd_opts.add_option(cmdoptions.require_hashes())
+    return info_dir
 
-        index_opts = cmdoptions.make_option_group(
-            cmdoptions.index_group,
-            self.parser,
+
+def read_wheel_metadata_file(source: ZipFile, path: str) -> bytes:
+    try:
+        return source.read(path)
+        # BadZipFile for general corruption, KeyError for missing entry,
+        # and RuntimeError for password-protected files
+    except (BadZipFile, KeyError, RuntimeError) as e:
+        raise UnsupportedWheel(f"could not read {path!r} file: {e!r}")
+
+
+def wheel_metadata(source: ZipFile, dist_info_dir: str) -> Message:
+    """Return the WHEEL metadata of an extracted wheel, if possible.
+    Otherwise, raise UnsupportedWheel.
+    """
+    path = f"{dist_info_dir}/WHEEL"
+    # Zip file path separators must be /
+    wheel_contents = read_wheel_metadata_file(source, path)
+
+    try:
+        wheel_text = wheel_contents.decode()
+    except UnicodeDecodeError as e:
+        raise UnsupportedWheel(f"error decoding {path!r}: {e!r}")
+
+    # FeedParser (used by Parser) does not raise any exceptions. The returned
+    # message may have .defects populated, but for backwards-compatibility we
+    # currently ignore them.
+    return Parser().parsestr(wheel_text)
+
+
+def wheel_version(wheel_data: Message) -> Tuple[int, ...]:
+    """Given WHEEL metadata, return the parsed Wheel-Version.
+    Otherwise, raise UnsupportedWheel.
+    """
+    version_text = wheel_data["Wheel-Version"]
+    if version_text is None:
+        raise UnsupportedWheel("WHEEL is missing Wheel-Version")
+
+    version = version_text.strip()
+
+    try:
+        return tuple(map(int, version.split(".")))
+    except ValueError:
+        raise UnsupportedWheel(f"invalid Wheel-Version: {version!r}")
+
+
+def check_compatibility(version: Tuple[int, ...], name: str) -> None:
+    """Raises errors or warns if called with an incompatible Wheel-Version.
+
+    pip should refuse to install a Wheel-Version that's a major series
+    ahead of what it's compatible with (e.g 2.0 > 1.1); and warn when
+    installing a version only minor version ahead (e.g 1.2 > 1.1).
+
+    version: a 2-tuple representing a Wheel-Version (Major, Minor)
+    name: name of wheel or package to raise exception about
+
+    :raises UnsupportedWheel: when an incompatible Wheel-Version is given
+    """
+    if version[0] > VERSION_COMPATIBLE[0]:
+        raise UnsupportedWheel(
+            "{}'s Wheel-Version ({}) is not compatible with this version "
+            "of pip".format(name, ".".join(map(str, version)))
         )
-
-        self.parser.insert_option_group(0, index_opts)
-        self.parser.insert_option_group(0, self.cmd_opts)
-
-    @with_cleanup
-    def run(self, options: Values, args: List[str]) -> int:
-        session = self.get_default_session(options)
-
-        finder = self._build_package_finder(options, session)
-
-        options.wheel_dir = normalize_path(options.wheel_dir)
-        ensure_dir(options.wheel_dir)
-
-        build_tracker = self.enter_context(get_build_tracker())
-
-        directory = TempDirectory(
-            delete=not options.no_clean,
-            kind="wheel",
-            globally_managed=True,
+    elif version > VERSION_COMPATIBLE:
+        logger.warning(
+            "Installing from a newer Wheel-Version (%s)",
+            ".".join(map(str, version)),
         )
-
-        reqs = self.get_requirements(args, options, finder, session)
-        check_legacy_setup_py_options(options, reqs)
-
-        wheel_cache = WheelCache(options.cache_dir)
-
-        preparer = self.make_requirement_preparer(
-            temp_build_dir=directory,
-            options=options,
-            build_tracker=build_tracker,
-            session=session,
-            finder=finder,
-            download_dir=options.wheel_dir,
-            use_user_site=False,
-            verbosity=self.verbosity,
-        )
-
-        resolver = self.make_resolver(
-            preparer=preparer,
-            finder=finder,
-            options=options,
-            wheel_cache=wheel_cache,
-            ignore_requires_python=options.ignore_requires_python,
-            use_pep517=options.use_pep517,
-        )
-
-        self.trace_basic_info(finder)
-
-        requirement_set = resolver.resolve(reqs, check_supported_wheels=True)
-
-        reqs_to_build: List[InstallRequirement] = []
-        for req in requirement_set.requirements.values():
-            if req.is_wheel:
-                preparer.save_linked_requirement(req)
-            elif should_build_for_wheel_command(req):
-                reqs_to_build.append(req)
-
-        preparer.prepare_linked_requirements_more(requirement_set.requirements.values())
-
-        # build wheels
-        build_successes, build_failures = build(
-            reqs_to_build,
-            wheel_cache=wheel_cache,
-            verify=(not options.no_verify),
-            build_options=options.build_options or [],
-            global_options=options.global_options or [],
-        )
-        for req in build_successes:
-            assert req.link and req.link.is_wheel
-            assert req.local_file_path
-            # copy from cache to target directory
-            try:
-                shutil.copy(req.local_file_path, options.wheel_dir)
-            except OSError as e:
-                logger.warning(
-                    "Building wheel for %s failed: %s",
-                    req.name,
-                    e,
-                )
-                build_failures.append(req)
-        if len(build_failures) != 0:
-            raise CommandError("Failed to build one or more wheels")
-
-        return SUCCESS
